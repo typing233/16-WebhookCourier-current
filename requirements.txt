@@ -4,3 +4,8 @@ sqlalchemy==2.0.36
 pydantic==2.10.3
 httpx==0.28.1
 apscheduler==3.10.4
+pydantic-settings>=2.0
+jsonschema>=4.0
+pytest>=7.0
+pytest-asyncio>=0.23
+pytest-cov>=4.0

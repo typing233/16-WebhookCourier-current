@@ -2,20 +2,14 @@ import time
 import threading
 from collections import defaultdict
 
+from webhook_courier.config import settings
+
 
 class TokenBucketLimiter:
-    """Per-endpoint token bucket rate limiter.
+    """Per-endpoint + global token bucket rate limiter.
 
-    Each endpoint gets its own bucket that refills at `rate` tokens/sec
-    up to `rate` capacity (1-second burst window).
-
-    Concurrency boundaries:
-    - Single process: thread-safe via threading.Lock. Multiple asyncio tasks
-      or threads within the same process share one limiter instance correctly.
-    - Multiple processes (e.g. gunicorn workers): each process holds its own
-      in-memory limiter, so the effective rate becomes N * configured_rate
-      across N workers. For true distributed rate limiting, replace this with
-      a shared store (Redis + Lua script or sliding-window counter).
+    Each endpoint gets its own bucket that refills at `rate` tokens/sec.
+    A global bucket caps total throughput across all endpoints.
     """
 
     def __init__(self):
@@ -23,6 +17,9 @@ class TokenBucketLimiter:
         self._last_refill: dict[str, float] = {}
         self._rates: dict[str, int] = defaultdict(lambda: 50)
         self._lock = threading.Lock()
+        self._global_tokens: float = float(settings.GLOBAL_RATE_LIMIT_PER_SEC)
+        self._global_last_refill: float = time.monotonic()
+        self._global_rate: int = settings.GLOBAL_RATE_LIMIT_PER_SEC
 
     def configure(self, endpoint_id: str, rate_per_sec: int):
         with self._lock:
@@ -34,8 +31,21 @@ class TokenBucketLimiter:
     def acquire(self, endpoint_id: str) -> bool:
         with self._lock:
             now = time.monotonic()
-            rate = self._rates[endpoint_id]
 
+            # Global rate limit
+            elapsed_global = now - self._global_last_refill
+            self._global_tokens = min(
+                float(self._global_rate),
+                self._global_tokens + elapsed_global * self._global_rate
+            )
+            self._global_last_refill = now
+            if self._global_tokens < 1.0:
+                from webhook_courier.metrics.collector import metrics
+                metrics.counter_inc("rate_limit_rejections_total", labels={"scope": "global"})
+                return False
+
+            # Per-endpoint rate limit
+            rate = self._rates[endpoint_id]
             if endpoint_id not in self._buckets:
                 self._buckets[endpoint_id] = float(rate)
                 self._last_refill[endpoint_id] = now
@@ -48,7 +58,11 @@ class TokenBucketLimiter:
 
             if self._buckets[endpoint_id] >= 1.0:
                 self._buckets[endpoint_id] -= 1.0
+                self._global_tokens -= 1.0
                 return True
+
+            from webhook_courier.metrics.collector import metrics
+            metrics.counter_inc("rate_limit_rejections_total", labels={"scope": "endpoint", "endpoint_id": endpoint_id})
             return False
 
     def remove(self, endpoint_id: str):
@@ -56,6 +70,10 @@ class TokenBucketLimiter:
             self._buckets.pop(endpoint_id, None)
             self._last_refill.pop(endpoint_id, None)
             self._rates.pop(endpoint_id, None)
+
+    def update_global_rate(self, rate: int):
+        with self._lock:
+            self._global_rate = rate
 
 
 rate_limiter = TokenBucketLimiter()
