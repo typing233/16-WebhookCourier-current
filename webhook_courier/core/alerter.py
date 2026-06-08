@@ -3,8 +3,10 @@ import logging
 import smtplib
 from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
+from typing import Optional
 
 import httpx
+from sqlalchemy.orm import Session
 
 from webhook_courier.database import SessionLocal
 from webhook_courier.models import AlertConfig, AlertLog, gen_id
@@ -20,14 +22,31 @@ class Alerter:
     Deduplicates alerts within a configurable cooldown window per endpoint+error.
     """
 
-    async def maybe_alert(self, endpoint_id: str, error: str, consecutive_failures: int):
-        db = SessionLocal()
+    async def maybe_alert(
+        self,
+        endpoint_id: str,
+        error: str,
+        consecutive_failures: int,
+        db: Optional[Session] = None,
+    ):
+        """Evaluate alert configs and send if threshold met and not suppressed.
+
+        Args:
+            endpoint_id: The endpoint that failed
+            error: Error description
+            consecutive_failures: Number of consecutive failures (total attempts)
+            db: Optional session for testing; if None, creates its own
+        """
+        owns_session = db is None
+        if owns_session:
+            db = SessionLocal()
         try:
             configs = db.query(AlertConfig).filter(
                 AlertConfig.is_active.is_(True),
                 (AlertConfig.endpoint_id == endpoint_id) | (AlertConfig.endpoint_id.is_(None)),
             ).all()
 
+            sent_count = 0
             for config in configs:
                 if consecutive_failures < config.failure_threshold:
                     continue
@@ -35,13 +54,17 @@ class Alerter:
                     continue
                 await self._send_alert(config, endpoint_id, error, consecutive_failures)
                 self._record_alert(db, config.id, endpoint_id, error)
+                sent_count += 1
             db.commit()
+            return sent_count
         except Exception as e:
             logger.error(f"Alert dispatch error: {e}", exc_info=True)
+            return 0
         finally:
-            db.close()
+            if owns_session:
+                db.close()
 
-    def _is_suppressed(self, db, config_id: str, endpoint_id: str, error: str, cooldown: int) -> bool:
+    def _is_suppressed(self, db: Session, config_id: str, endpoint_id: str, error: str, cooldown: int) -> bool:
         fingerprint = self._error_fingerprint(error)
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=cooldown)
         existing = db.query(AlertLog).filter(
@@ -52,7 +75,7 @@ class Alerter:
         ).first()
         return existing is not None
 
-    def _record_alert(self, db, config_id: str, endpoint_id: str, error: str):
+    def _record_alert(self, db: Session, config_id: str, endpoint_id: str, error: str):
         log = AlertLog(
             id=gen_id(),
             config_id=config_id,

@@ -8,7 +8,7 @@ from sqlalchemy import update
 
 from webhook_courier.database import SessionLocal
 from webhook_courier.models import (
-    Message, Endpoint, DeadLetter, DeliveryLog, MessageStatus, gen_id
+    Message, Endpoint, Application, DeadLetter, DeliveryLog, MessageStatus, gen_id
 )
 from webhook_courier.config import settings
 from webhook_courier.core.rate_limiter import rate_limiter
@@ -33,6 +33,9 @@ class Dispatcher:
         self._running = False
         self._task: asyncio.Task | None = None
         self._semaphore: asyncio.Semaphore | None = None
+
+    def update_concurrency(self, concurrency: int):
+        self._semaphore = asyncio.Semaphore(concurrency)
 
     async def start(self):
         self._running = True
@@ -162,7 +165,14 @@ class Dispatcher:
                 self._mark_dead(db, msg, None, "Endpoint inactive or deleted")
                 return
 
-            headers = sign_payload(msg["payload"], endpoint.secret)
+            # Use application signing_key if endpoint belongs to an app, else endpoint secret
+            signing_secret = endpoint.secret
+            if endpoint.app_id:
+                app_obj = db.query(Application).filter(Application.id == endpoint.app_id).first()
+                if app_obj and app_obj.signing_key:
+                    signing_secret = app_obj.signing_key
+
+            headers = sign_payload(msg["payload"], signing_secret)
             headers["Content-Type"] = "application/json"
 
             timeout = endpoint.per_attempt_timeout or settings.DELIVERY_TIMEOUT
@@ -230,8 +240,9 @@ class Dispatcher:
         if retries_used >= msg["max_retries"]:
             self._mark_dead(db, msg, status_code, error)
             self._log_attempt(msg, new_attempt, "dead", status_code, error, latency_ms)
+            # Alert with the actual total attempts (which equals max_retries + 1)
             asyncio.get_event_loop().create_task(
-                alerter.maybe_alert(msg["endpoint_id"], error, endpoint.failure_count)
+                alerter.maybe_alert(msg["endpoint_id"], error, new_attempt)
             )
         else:
             jitter = endpoint.jitter_strategy or "full"

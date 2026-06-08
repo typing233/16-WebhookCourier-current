@@ -43,6 +43,13 @@ async def lifespan(app: FastAPI):
     finally:
         db.close()
 
+    def _on_config_reload(new_settings):
+        dispatcher.update_concurrency(new_settings.DISPATCHER_CONCURRENCY)
+        rate_limiter.update_global_rate(new_settings.GLOBAL_RATE_LIMIT_PER_SEC)
+        health_checker.interval = new_settings.HEALTH_CHECK_INTERVAL
+
+    settings.on_reload(_on_config_reload)
+
     await dispatcher.start()
     await health_checker.start()
     yield

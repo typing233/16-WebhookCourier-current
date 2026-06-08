@@ -81,3 +81,25 @@ def delete_subscription(
         raise HTTPException(404, "Subscription not found")
     db.delete(sub)
     db.commit()
+
+
+@router.patch("/{subscription_id}", response_model=SubscriptionResponse)
+def update_subscription(
+    subscription_id: str,
+    body: dict,
+    db: Session = Depends(get_db),
+    app: Application | None = Depends(get_current_app),
+):
+    query = db.query(Subscription).filter(Subscription.id == subscription_id)
+    if app:
+        query = query.filter(Subscription.app_id == app.id)
+    sub = query.first()
+    if not sub:
+        raise HTTPException(404, "Subscription not found")
+    if "event_type" in body:
+        sub.event_type = body["event_type"]
+    if "is_active" in body:
+        sub.is_active = body["is_active"]
+    db.commit()
+    db.refresh(sub)
+    return sub

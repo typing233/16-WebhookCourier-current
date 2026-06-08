@@ -1,3 +1,4 @@
+import fnmatch
 import logging
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -94,13 +95,16 @@ def route_message(
         raise HTTPException(422, err)
 
     query = db.query(Subscription).filter(
-        Subscription.event_type == body.event_type,
         Subscription.is_active.is_(True),
     )
     if app:
         query = query.filter(Subscription.app_id == app.id)
 
-    subscriptions = query.all()
+    all_subs = query.all()
+    subscriptions = [
+        s for s in all_subs
+        if s.event_type == body.event_type or fnmatch.fnmatch(body.event_type, s.event_type)
+    ]
     if not subscriptions:
         raise HTTPException(404, f"No subscriptions found for event_type '{body.event_type}'")
 
@@ -191,6 +195,51 @@ def get_message(
     msg = query.first()
     if not msg:
         raise HTTPException(404, "Message not found")
+    return _to_response(msg)
+
+
+@router.post("/{message_id}/cancel", response_model=MessageResponse)
+def cancel_message(
+    message_id: str,
+    db: Session = Depends(get_db),
+    app: Application | None = Depends(get_current_app),
+):
+    """Cancel a pending or in-flight message."""
+    query = db.query(Message).filter(Message.id == message_id)
+    if app:
+        query = query.filter(Message.app_id == app.id)
+    msg = query.first()
+    if not msg:
+        raise HTTPException(404, "Message not found")
+    if msg.status not in (MessageStatus.PENDING, MessageStatus.IN_FLIGHT):
+        raise HTTPException(409, f"Cannot cancel message in '{msg.status.value}' status")
+    msg.status = MessageStatus.DEAD
+    msg.last_error = "cancelled"
+    db.commit()
+    db.refresh(msg)
+    return _to_response(msg)
+
+
+@router.post("/{message_id}/retry", response_model=MessageResponse)
+def retry_message(
+    message_id: str,
+    db: Session = Depends(get_db),
+    app: Application | None = Depends(get_current_app),
+):
+    """Retry a dead/failed message by resetting to pending."""
+    query = db.query(Message).filter(Message.id == message_id)
+    if app:
+        query = query.filter(Message.app_id == app.id)
+    msg = query.first()
+    if not msg:
+        raise HTTPException(404, "Message not found")
+    if msg.status != MessageStatus.DEAD:
+        raise HTTPException(409, f"Only dead messages can be retried, current status: '{msg.status.value}'")
+    msg.status = MessageStatus.PENDING
+    msg.next_attempt_at = datetime.now(timezone.utc)
+    msg.last_error = None
+    db.commit()
+    db.refresh(msg)
     return _to_response(msg)
 
 
