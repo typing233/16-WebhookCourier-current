@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.py[cod]
+logs/
+*.db
+*.sqlite
+*.sqlite3
+1-1*.png
