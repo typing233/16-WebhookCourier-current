@@ -8,6 +8,14 @@ class TokenBucketLimiter:
 
     Each endpoint gets its own bucket that refills at `rate` tokens/sec
     up to `rate` capacity (1-second burst window).
+
+    Concurrency boundaries:
+    - Single process: thread-safe via threading.Lock. Multiple asyncio tasks
+      or threads within the same process share one limiter instance correctly.
+    - Multiple processes (e.g. gunicorn workers): each process holds its own
+      in-memory limiter, so the effective rate becomes N * configured_rate
+      across N workers. For true distributed rate limiting, replace this with
+      a shared store (Redis + Lua script or sliding-window counter).
     """
 
     def __init__(self):

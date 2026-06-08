@@ -4,6 +4,7 @@ import time
 from datetime import datetime, timezone, timedelta
 
 import httpx
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from webhook_courier.database import SessionLocal
@@ -24,6 +25,11 @@ class Dispatcher:
     On startup, reclaims any IN_FLIGHT messages (crash recovery).
     Polls PENDING messages from persistent storage and delivers them
     with exponential backoff retry and per-endpoint rate limiting.
+
+    Claim strategy uses atomic UPDATE...WHERE status='PENDING' so that
+    concurrent workers/instances sharing the same database will never
+    claim the same message twice. For SQLite this relies on its write
+    serialization; for PostgreSQL use SELECT...FOR UPDATE SKIP LOCKED.
     """
 
     def __init__(self):
@@ -78,31 +84,61 @@ class Dispatcher:
                 await asyncio.sleep(POLL_INTERVAL)
 
     def _fetch_pending_batch(self) -> list[dict]:
+        """Atomically claim a batch of pending messages.
+
+        Uses UPDATE...WHERE status='PENDING' to prevent multiple workers from
+        claiming the same message. Only rows actually transitioned from PENDING
+        to IN_FLIGHT by THIS statement are returned.
+        """
         db = SessionLocal()
         try:
             now = datetime.now(timezone.utc)
-            rows = (
+            # Step 1: identify candidates
+            candidate_ids = [
+                row[0]
+                for row in db.execute(
+                    select(Message.id)
+                    .where(
+                        Message.status == MessageStatus.PENDING,
+                        Message.next_attempt_at <= now,
+                    )
+                    .order_by(Message.next_attempt_at)
+                    .limit(BATCH_SIZE)
+                ).fetchall()
+            ]
+            if not candidate_ids:
+                return []
+
+            # Step 2: atomic claim — only transitions rows still in PENDING state
+            db.execute(
+                update(Message)
+                .where(
+                    Message.id.in_(candidate_ids),
+                    Message.status == MessageStatus.PENDING,
+                )
+                .values(status=MessageStatus.IN_FLIGHT)
+            )
+            db.commit()
+
+            # Step 3: read back only the rows we actually claimed
+            claimed = (
                 db.query(Message)
                 .filter(
-                    Message.status == MessageStatus.PENDING,
-                    Message.next_attempt_at <= now,
+                    Message.id.in_(candidate_ids),
+                    Message.status == MessageStatus.IN_FLIGHT,
                 )
-                .order_by(Message.next_attempt_at)
-                .limit(BATCH_SIZE)
                 .all()
             )
-            result = []
-            for msg in rows:
-                msg.status = MessageStatus.IN_FLIGHT
-                result.append({
+            return [
+                {
                     "id": msg.id,
                     "endpoint_id": msg.endpoint_id,
                     "payload": msg.payload,
                     "attempt_count": msg.attempt_count,
                     "max_retries": msg.max_retries,
-                })
-            db.commit()
-            return result
+                }
+                for msg in claimed
+            ]
         finally:
             db.close()
 
@@ -158,16 +194,17 @@ class Dispatcher:
 
     def _handle_failure(self, db: Session, msg: dict, status_code: int | None, error: str, endpoint: Endpoint):
         new_attempt = msg["attempt_count"] + 1
+        retries_used = new_attempt - 1  # first attempt is not a retry
 
         logger.warning(
             f"Delivery failed: {error}",
             extra={"endpoint_id": msg["endpoint_id"], "message_id": msg["id"], "attempt": new_attempt},
         )
 
-        if new_attempt >= msg["max_retries"]:
+        if retries_used >= msg["max_retries"]:
             self._mark_dead(db, msg, status_code, error)
         else:
-            delay = endpoint.retry_base_interval * (2 ** new_attempt)
+            delay = endpoint.retry_base_interval * (2 ** retries_used)
             next_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
             db.query(Message).filter(Message.id == msg["id"]).update({
                 "status": MessageStatus.PENDING,

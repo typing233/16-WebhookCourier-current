@@ -2,6 +2,7 @@ import logging
 import logging.handlers
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -9,8 +10,9 @@ class StructuredFormatter(logging.Formatter):
     """JSON structured log formatter for container-friendly output."""
 
     def format(self, record: logging.LogRecord) -> str:
+        dt = datetime.fromtimestamp(record.created, tz=timezone.utc)
         log_entry = {
-            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S.%f"),
+            "ts": dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{int(dt.microsecond / 1000):03d}Z",
             "level": record.levelname,
             "logger": record.name,
             "msg": record.getMessage(),

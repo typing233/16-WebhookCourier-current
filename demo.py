@@ -11,7 +11,6 @@ Usage:
 """
 import asyncio
 import json
-import time
 import httpx
 import uvicorn
 import threading
@@ -60,6 +59,20 @@ def run_receiver():
     uvicorn.run(receiver_app, host="127.0.0.1", port=RECEIVER_PORT, log_level="warning")
 
 
+async def wait_for_status(client: httpx.AsyncClient, message_id: str, target_statuses: set[str], label: str, timeout: int = 60) -> dict:
+    """Poll until a message reaches one of the target statuses."""
+    elapsed = 0
+    while elapsed < timeout:
+        await asyncio.sleep(1)
+        elapsed += 1
+        st = (await client.get(f"/messages/{message_id}")).json()
+        if st["status"] in target_statuses:
+            return st
+        if elapsed % 5 == 0:
+            print(f"    ...waiting for {label}: status={st['status']}, attempts={st['attempt_count']} ({elapsed}s)")
+    raise TimeoutError(f"{label} did not reach {target_statuses} within {timeout}s")
+
+
 # --- Demo Logic ---
 async def run_demo():
     print("\n" + "=" * 60)
@@ -87,7 +100,7 @@ async def run_demo():
             "retry_base_interval": 1.0,
             "rate_limit_per_sec": 5,
         })).json()
-        print(f"    Created: {ep_flaky['id'][:8]}... (flaky)")
+        print(f"    Created: {ep_flaky['id'][:8]}... (flaky, max_retries=5)")
 
         ep_dead = (await client.post("/endpoints", json={
             "url": f"http://127.0.0.1:{RECEIVER_PORT}/webhook/dead",
@@ -96,7 +109,7 @@ async def run_demo():
             "max_retries": 2,
             "retry_base_interval": 1.0,
         })).json()
-        print(f"    Created: {ep_dead['id'][:8]}... (always fails)")
+        print(f"    Created: {ep_dead['id'][:8]}... (always fails, max_retries=2)")
 
         # 2. Ingest messages
         print("\n[2] Ingesting messages...")
@@ -135,41 +148,49 @@ async def run_demo():
             "idempotency_key": "dead-test-001",
             "payload": json.dumps({"event": "user.deleted", "user_id": "USR-999"}),
         })).json()
-        print(f"    Message {msg3['id'][:8]}... -> dead endpoint")
+        print(f"    Message {msg3['id'][:8]}... -> dead endpoint (max_retries=2 -> 3 total attempts)")
 
-        # Wait for delivery attempts
-        print("\n[6] Waiting for delivery cycles...")
-        for i in range(15):
-            await asyncio.sleep(2)
-            status = (await client.get(f"/messages/{msg3['id']}")).json()
-            if status["status"] == "dead":
-                print(f"    Dead letter reached after {i*2}s")
-                break
-            print(f"    ...{i*2}s elapsed, msg3 status: {status['status']} (attempts: {status['attempt_count']})")
+        # 6. Wait for dead letter
+        print("\n[6] Waiting for dead-endpoint message to exhaust retries...")
+        st3 = await wait_for_status(client, msg3["id"], {"dead"}, "dead-endpoint msg")
+        print(f"    Dead letter reached: attempts={st3['attempt_count']} (1 initial + 2 retries) ✓")
 
-        # 6. Check DLQ
-        print("\n[7] Checking dead letter queue...")
+        # 7. Wait for flaky message to succeed
+        print("\n[7] Waiting for flaky-endpoint message to be delivered...")
+        st2 = await wait_for_status(client, msg2["id"], {"delivered"}, "flaky-endpoint msg")
+        print(f"    Flaky message delivered: attempts={st2['attempt_count']} (3 failures + 1 success = 4 attempts) ✓")
+
+        # 8. Check DLQ
+        print("\n[8] Checking dead letter queue...")
         dlq = (await client.get("/dlq")).json()
         print(f"    Dead letters: {len(dlq)}")
         for dl in dlq:
-            print(f"      - {dl['id'][:8]}... | msg: {dl['message_id'][:8]}... | error: {dl['last_error']}")
+            print(f"      - {dl['id'][:8]}... | msg: {dl['message_id'][:8]}... | attempts: {dl['attempt_count']} | error: {dl['last_error']}")
 
-        # 7. Replay from DLQ
+        # 9. Replay from DLQ and wait for its terminal state
+        replay_msg_id = None
         if dlq:
-            print("\n[8] Replaying first dead letter...")
+            print("\n[9] Replaying first dead letter...")
             replay_resp = (await client.post(f"/dlq/{dlq[0]['id']}/replay")).json()
-            print(f"    New message created: {replay_resp['new_message_id'][:8]}...")
+            replay_msg_id = replay_resp["new_message_id"]
+            print(f"    New message created: {replay_msg_id[:8]}...")
+            print("    Waiting for replayed message to reach terminal state...")
+            st_replay = await wait_for_status(client, replay_msg_id, {"delivered", "dead"}, "replayed msg")
+            print(f"    Replayed message final state: status={st_replay['status']}, attempts={st_replay['attempt_count']} ✓")
 
-        # 8. Verify delivery
-        print("\n[9] Checking message statuses...")
+        # 10. Final summary
+        print("\n[10] Final message statuses:")
         for label, mid in [("reliable", msg1["id"]), ("flaky", msg2["id"]), ("dead", msg3["id"])]:
             st = (await client.get(f"/messages/{mid}")).json()
             print(f"    {label}: status={st['status']}, attempts={st['attempt_count']}")
+        if replay_msg_id:
+            st = (await client.get(f"/messages/{replay_msg_id}")).json()
+            print(f"    replay:   status={st['status']}, attempts={st['attempt_count']}")
 
-        print(f"\n[10] Total messages received by /ok endpoint: {len(received_messages)}")
+        print(f"\n[11] Total messages received by /ok endpoint: {len(received_messages)}")
 
     print("\n" + "=" * 60)
-    print("  DEMO COMPLETE")
+    print("  DEMO COMPLETE — all messages in terminal state")
     print("=" * 60 + "\n")
 
 
@@ -178,13 +199,10 @@ def run_courier():
 
 
 if __name__ == "__main__":
-    # Start receiver in background thread
     t_receiver = threading.Thread(target=run_receiver, daemon=True)
     t_receiver.start()
 
-    # Start courier in background thread
     t_courier = threading.Thread(target=run_courier, daemon=True)
     t_courier.start()
 
-    # Run demo
     asyncio.run(run_demo())
