@@ -28,6 +28,7 @@ class Alerter:
         error: str,
         consecutive_failures: int,
         db: Optional[Session] = None,
+        app_id: Optional[str] = None,
     ):
         """Evaluate alert configs and send if threshold met and not suppressed.
 
@@ -36,15 +37,21 @@ class Alerter:
             error: Error description
             consecutive_failures: Number of consecutive failures (total attempts)
             db: Optional session for testing; if None, creates its own
+            app_id: If provided, only match configs belonging to this app or global
         """
         owns_session = db is None
         if owns_session:
             db = SessionLocal()
         try:
-            configs = db.query(AlertConfig).filter(
+            query = db.query(AlertConfig).filter(
                 AlertConfig.is_active.is_(True),
                 (AlertConfig.endpoint_id == endpoint_id) | (AlertConfig.endpoint_id.is_(None)),
-            ).all()
+            )
+            if app_id:
+                query = query.filter(
+                    (AlertConfig.app_id == app_id) | (AlertConfig.app_id.is_(None))
+                )
+            configs = query.all()
 
             sent_count = 0
             for config in configs:

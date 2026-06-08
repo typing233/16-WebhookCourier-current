@@ -242,7 +242,7 @@ class Dispatcher:
             self._log_attempt(msg, new_attempt, "dead", status_code, error, latency_ms)
             # Alert with the actual total attempts (which equals max_retries + 1)
             asyncio.get_event_loop().create_task(
-                alerter.maybe_alert(msg["endpoint_id"], error, new_attempt)
+                alerter.maybe_alert(msg["endpoint_id"], error, new_attempt, app_id=msg.get("app_id"))
             )
         else:
             jitter = endpoint.jitter_strategy or "full"
@@ -266,7 +266,7 @@ class Dispatcher:
 
             if retries_used >= 2:
                 asyncio.get_event_loop().create_task(
-                    alerter.maybe_alert(msg["endpoint_id"], error, retries_used)
+                    alerter.maybe_alert(msg["endpoint_id"], error, retries_used, app_id=msg.get("app_id"))
                 )
 
     def _mark_dead(self, db, msg: dict, status_code: int | None, error: str):

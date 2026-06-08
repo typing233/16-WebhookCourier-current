@@ -94,6 +94,15 @@ class MessageListResponse(BaseModel):
     limit: int
 
 
+class BatchMessageRequest(BaseModel):
+    ids: list[str] = Field(..., min_length=1, max_length=1000)
+
+
+class BatchMessageResponse(BaseModel):
+    affected_count: int
+    ids: list[str]
+
+
 # --- Dead Letter Schemas ---
 
 class DeadLetterResponse(BaseModel):

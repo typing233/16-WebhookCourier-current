@@ -47,8 +47,15 @@ def list_alert_configs(
 
 
 @router.get("/{config_id}", response_model=AlertConfigResponse)
-def get_alert_config(config_id: str, db: Session = Depends(get_db)):
-    config = db.query(AlertConfig).filter(AlertConfig.id == config_id).first()
+def get_alert_config(
+    config_id: str,
+    db: Session = Depends(get_db),
+    app: Application | None = Depends(get_current_app),
+):
+    query = db.query(AlertConfig).filter(AlertConfig.id == config_id)
+    if app:
+        query = query.filter(AlertConfig.app_id == app.id)
+    config = query.first()
     if not config:
         raise HTTPException(404, "Alert config not found")
     return config

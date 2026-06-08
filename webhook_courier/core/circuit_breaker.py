@@ -118,6 +118,14 @@ class CircuitBreakerManager:
             if endpoint_id in self._circuits:
                 self._circuits[endpoint_id] = EndpointCircuit()
 
+    def force_close(self, endpoint_id: str):
+        """Force circuit to CLOSED state (used by health checker on successful probe)."""
+        with self._lock:
+            circuit = self._get_circuit(endpoint_id)
+            circuit.state = CircuitState.CLOSED
+            circuit.failure_count = 0
+            circuit.half_open_successes = 0
+
     def load_from_db(self, endpoint_id: str, state_str: str, failure_count: int, success_count: int):
         with self._lock:
             circuit = self._get_circuit(endpoint_id)

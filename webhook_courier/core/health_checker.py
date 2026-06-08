@@ -93,7 +93,11 @@ class HealthChecker:
                 resp = await client.head(url)
 
             if 200 <= resp.status_code < 400:
-                circuit_breaker.record_success(endpoint_id)
+                state_before = circuit_breaker.get_state(endpoint_id)
+                if state_before in (CircuitState.OPEN, CircuitState.HALF_OPEN):
+                    circuit_breaker.force_close(endpoint_id)
+                else:
+                    circuit_breaker.record_success(endpoint_id)
                 self._persist_health(endpoint_id, success=True, was_active=was_active)
             else:
                 circuit_breaker.record_failure(endpoint_id)

@@ -10,7 +10,8 @@ from webhook_courier.models import (
     Message, Endpoint, Subscription, Application, MessageStatus, gen_id
 )
 from webhook_courier.schemas import (
-    MessageIngest, MessageRoute, MessageResponse, MessageListResponse
+    MessageIngest, MessageRoute, MessageResponse, MessageListResponse,
+    BatchMessageRequest, BatchMessageResponse,
 )
 from webhook_courier.core.schema_validator import validate_payload
 from webhook_courier.auth.dependencies import get_current_app
@@ -183,6 +184,55 @@ def list_messages(
     )
 
 
+@router.post("/batch/cancel", response_model=BatchMessageResponse)
+def batch_cancel_messages(
+    body: BatchMessageRequest,
+    db: Session = Depends(get_db),
+    app: Application | None = Depends(get_current_app),
+):
+    """Cancel multiple pending/in-flight messages at once."""
+    query = db.query(Message).filter(
+        Message.id.in_(body.ids),
+        Message.status.in_([MessageStatus.PENDING, MessageStatus.IN_FLIGHT]),
+    )
+    if app:
+        query = query.filter(Message.app_id == app.id)
+
+    messages = query.all()
+    affected_ids = []
+    for msg in messages:
+        msg.status = MessageStatus.DEAD
+        msg.last_error = "cancelled"
+        affected_ids.append(msg.id)
+    db.commit()
+    return BatchMessageResponse(affected_count=len(affected_ids), ids=affected_ids)
+
+
+@router.post("/batch/retry", response_model=BatchMessageResponse)
+def batch_retry_messages(
+    body: BatchMessageRequest,
+    db: Session = Depends(get_db),
+    app: Application | None = Depends(get_current_app),
+):
+    """Retry multiple dead messages at once."""
+    query = db.query(Message).filter(
+        Message.id.in_(body.ids),
+        Message.status == MessageStatus.DEAD,
+    )
+    if app:
+        query = query.filter(Message.app_id == app.id)
+
+    messages = query.all()
+    affected_ids = []
+    for msg in messages:
+        msg.status = MessageStatus.PENDING
+        msg.next_attempt_at = datetime.now(timezone.utc)
+        msg.last_error = None
+        affected_ids.append(msg.id)
+    db.commit()
+    return BatchMessageResponse(affected_count=len(affected_ids), ids=affected_ids)
+
+
 @router.get("/{message_id}", response_model=MessageResponse)
 def get_message(
     message_id: str,
@@ -241,6 +291,25 @@ def retry_message(
     db.commit()
     db.refresh(msg)
     return _to_response(msg)
+
+
+@router.delete("/{message_id}", status_code=204)
+def delete_message(
+    message_id: str,
+    db: Session = Depends(get_db),
+    app: Application | None = Depends(get_current_app),
+):
+    """Delete a message (only terminal states: dead or delivered)."""
+    query = db.query(Message).filter(Message.id == message_id)
+    if app:
+        query = query.filter(Message.app_id == app.id)
+    msg = query.first()
+    if not msg:
+        raise HTTPException(404, "Message not found")
+    if msg.status not in (MessageStatus.DEAD, MessageStatus.DELIVERED):
+        raise HTTPException(409, f"Cannot delete message in '{msg.status.value}' status")
+    db.delete(msg)
+    db.commit()
 
 
 def _to_response(msg: Message) -> MessageResponse:
